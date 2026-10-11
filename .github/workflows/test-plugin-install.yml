@@ -37,6 +37,18 @@ jobs:
       - name: Test eval privacy controls offline
         run: node --test scripts/run-evals-privacy-test.js
 
+      - name: Check the issue 309 workflow experiment
+        run: node experiments/309/check.js --check
+
+      - name: Test the workflow experiment
+        run: node --test experiments/309/check-test.js
+
+      - name: Preflight issue 309 baseline offline
+        run: node scripts/run-evals.js --behavioral spec-driven-development --dry-run
+
+      - name: Preflight issue 309 candidate offline
+        run: node scripts/run-evals.js --behavioral spec-driven-development --skill-dir experiments/309/aisp/spec_driven_development_aisp --dry-run
+
       - name: Run skill evals (trigger + routing)
         run: node scripts/run-evals.js --min-rank1 95
 
@@ -105,6 +117,16 @@ jobs:
           scripts/validate-commands-test.js
           scripts/validate-artifact-paths-test.js
           scripts/floor-guard-reference-test.js
+          experiments/309/check-test.js
+
+      - name: Check the issue 309 workflow experiment
+        run: node experiments/309/check.js --check
+
+      - name: Preflight issue 309 baseline offline
+        run: node scripts/run-evals.js --behavioral spec-driven-development --dry-run
+
+      - name: Preflight issue 309 candidate offline
+        run: node scripts/run-evals.js --behavioral spec-driven-development --skill-dir experiments/309/aisp/spec_driven_development_aisp --dry-run
 
       - name: Validate all skills
         run: node scripts/validate-skills.js

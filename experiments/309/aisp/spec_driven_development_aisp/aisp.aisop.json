@@ -1,0 +1,220 @@
+[
+  {
+    "role": "system",
+    "content": {
+      "protocol": "AISP V1.0.0",
+      "axiom_0": "Human_Sovereignty_and_Wellbeing",
+      "id": "spec_driven_development_aisp",
+      "name": "Spec-Driven Development Pilot",
+      "version": "0.1.0",
+      "license": "MIT",
+      "summary": "Creates a reviewed specification before planning, task breakdown, and incremental implementation.",
+      "description": "Creates specs before coding. Use when starting a new project, feature, or significant change and no specification exists yet. Use when drafting a PRD or requirements document with objectives and scope, or when requirements are unclear, ambiguous, or only exist as a vague idea. Use when a single requirement spans several independently testable capabilities and needs decomposing into a capability map of modules before specifying.",
+      "flow_format": "jsonflow",
+      "loading_mode": "node",
+      "tools": ["filesystem", "shell", "skill"],
+      "params": {"feature_goal": "string"},
+      "system_prompt": ""
+    }
+  },
+  {
+    "role": "user",
+    "content": {
+      "instruction": "STRICTLY OBEY aisp_contract; its non_negotiable rules are inviolable; then RUN aisop.main",
+      "user_input": "{user_input}",
+      "aisp_contract": {
+        "profile": "aisp.skill.v1",
+        "invocation": {
+          "mode": "auto_or_manual",
+          "when_to_use": [
+            "starting a new project, feature, or significant change without a specification",
+            "drafting a PRD or requirements document with objectives and scope",
+            "clarifying ambiguous or incomplete requirements",
+            "changing multiple files or modules or making an architectural decision",
+            "implementing work expected to take more than 30 minutes",
+            "decomposing a request spanning independently testable capabilities"
+          ],
+          "when_not_to_use": [
+            "single-line fixes or typo corrections",
+            "changes whose requirements are unambiguous and self-contained"
+          ]
+        },
+        "non_negotiable": [
+          {"rule": "Require an explicit approve decision at capability-map review before selecting and specifying a module.", "enforced_by": "review_map.step2:sys.assert"},
+          {"rule": "Require an explicit approve decision at specification review before planning.", "enforced_by": "review_spec.step2:sys.assert"},
+          {"rule": "Require an explicit approve decision at implementation-plan review before task breakdown.", "enforced_by": "review_plan.step2:sys.assert"},
+          {"rule": "Require an explicit approve decision at task-list review before implementation.", "enforced_by": "review_tasks.step2:sys.assert"},
+          {"rule": "Require an explicit approve decision at implementation-result review before advancing or declaring completion.", "enforced_by": "review_result.step2:sys.assert"},
+          {"rule": "Follow the declared scope branches and phase order; never skip required review nodes.", "enforced_by": "aisop.main"}
+        ],
+        "discovery": {"category": "engineering", "tags": ["specification", "requirements", "capability-map", "human-review"]},
+        "risk_level": "medium",
+        "resources": []
+      },
+      "aisop": {
+        "main": {
+          "scope": {"branches": {"single": "specify", "multiple": "capability_map"}},
+          "capability_map": {"next": ["review_map"]},
+          "review_map": {"next": ["prepare_module"]},
+          "prepare_module": {"next": ["specify"]},
+          "specify": {"next": ["review_spec"]},
+          "review_spec": {"next": ["plan"]},
+          "plan": {"next": ["review_plan"]},
+          "review_plan": {"next": ["tasks"]},
+          "tasks": {"next": ["review_tasks"]},
+          "review_tasks": {"next": ["implement"]},
+          "implement": {"next": ["verify"]},
+          "verify": {"next": ["review_result"]},
+          "review_result": {"next": ["next_module"]},
+          "next_module": {"branches": {"more": "specify", "done": "end"}},
+          "end": {}
+        }
+      },
+      "functions": {
+        "scope": {
+          "step1": "Inspect the request for independently testable capabilities: distinct consumers or data, acceptance criteria that cluster into separately shippable groups, or a capability that could be cut or replaced without rewriting the others.",
+          "step2": "Return multiple only when that test holds. Otherwise return single and go directly to Specify, with one feature scope and no imposed module hierarchy. Record the active initiative, scope kind, current module or single-feature identity, and artifact revision context for subsequent phases.",
+          "output_mapping": "scope_kind",
+          "execute_mode": "inline",
+          "constraints": [
+            "Phase 0 is the exception, not the rule. A single-capability feature skips the capability map.",
+            "'It's one big feature; splitting it is overhead' does not excuse a monolithic spec when acceptance criteria form independently testable groups; a ten-line capability map avoids making every downstream task reason over the whole contract.",
+            "'I'll decompose during planning' is too late: planning slices tasks within a spec, while module boundaries and dependency direction must be decided before writing the spec."
+          ]
+        },
+        "capability_map": {
+          "step1": "Before writing any module specification, propose a small capability map at the project root: initiative name, a module table with Module id / Responsibility / Depends on, and an explicit build order. This is a reviewable map, not a project plan.",
+          "step2": "Choose stable kebab-case module ids once and never rename them mid-initiative. Record one-way dependencies with no cycles; mutually dependent modules are one module. Place each provider's interface contract in that provider module's spec and use api-and-interface-design when designing it.",
+          "step3": "Show the proposed module boundaries, dependency direction, and build order to the human. Record the map artifact identifier and revision; do not write a module spec before map approval.",
+          "output_mapping": "capability_map_revision",
+          "execute_mode": "inline"
+        },
+        "review_map": {
+          "step1": "sys.io.confirm('Approve the capability map for this initiative, artifact, and revision, including module boundaries, dependency direction, and build order?', options=['approve', 'reject', 'modify']) -> map_decision",
+          "step2": "sys.assert('map_decision == \"approve\"', 'Capability map must be approved before selecting or specifying a module')",
+          "step3": "sys.state.set('map_decision', map_decision)",
+          "step4": "Record the actual human approval bound to this initiative and map artifact revision, and save the approved map at the project root as the index of module work.",
+          "output_mapping": "map_decision",
+          "execute_mode": "inline",
+          "constraints": [
+            "Approval must come from the human for the displayed map artifact and revision. A different initiative, stale revision, inferred consent, or agent-written approve value is not approval.",
+            "On reject or modify, do not advance. A generic agent ends its turn, incorporates requested changes into a new revision, and requests fresh approval. A conforming runtime must stop on failed assertion; headless confirmation must fail with confirm_timeout and must never auto-approve."
+          ]
+        },
+        "prepare_module": {
+          "step1": "Select the first unfinished module in the approved map's dependency order. Each module runs Specify -> Plan -> Tasks -> Implement with its own objective, boundaries, and success criteria. Select work by stable module id, never by guessing which spec filename is active.",
+          "step2": "Initialize the module artifact context and fresh approval records. Save module specs alongside the root map as SPEC-<module-id>.md, such as SPEC-identity.md or SPEC-billing.md, unless an existing specification system owns the artifact format and storage.",
+          "output_mapping": "current_module",
+          "execute_mode": "inline",
+          "constraints": ["Do not reuse another module's approval or begin a module before its prerequisite modules satisfy the approved build order."]
+        },
+        "specify": {
+          "step1": "Start from the high-level vision and ask clarifying questions until requirements are concrete. Before writing any spec content, list assumptions explicitly and invite correction; never silently fill ambiguous requirements.",
+          "step2": "Reframe vague instructions into specific, testable success criteria and confirm the targets with the human. For example, 'make the dashboard faster' needs agreed loading, data latency, and layout stability targets rather than guesses.",
+          "step3": "Write all six core areas: Objective (what, why, users, success); Commands (full executable build/test/lint/dev commands with flags); Project Structure (source, tests, docs); Code Style (a real snippet plus naming and formatting); Testing Strategy (framework, locations, coverage expectations, and test levels); Boundaries (Always do / Ask first / Never do).",
+          "step4": "Use a reviewable spec with Objective, Tech Stack and dependency versions, Commands, Project Structure, Code Style, Testing Strategy, Boundaries, Success Criteria, and Open Questions. Boundaries distinguish routine obligations from approvals such as schema/dependency/CI changes and prohibitions such as secrets, vendor edits, or removing failing tests without approval.",
+          "step5": "Keep the project's existing OpenSpec or other specification system's artifact format and storage conventions instead of creating a duplicate SPEC.md. This workflow owns clarification, content, and approval; the external system owns representation. Otherwise save the spec in the repository, using the approved module-id naming convention when a map exists.",
+          "step6": "Record the saved specification's artifact identifier, current module, revision, and originating turn. Summarize it, list Open Questions, ask for approval or changes, and STOP THE CURRENT TURN IMMEDIATELY. Resume review_spec only after a real human response in a later turn; do not start a plan, invoke planning-and-task-breakdown, or write implementation code in the specification-writing turn.",
+          "output_mapping": "specification_revision",
+          "execute_mode": "inline",
+          "constraints": [
+            "The written spec is the shared source of truth for what is being built, why, and how completion is measured; code without a spec is guessing.",
+            "'This is simple, I don't need a spec' does not remove acceptance criteria; a two-line spec can suffice. 'I'll write the spec after I code it' is documentation, not specification, and loses clarity before code.",
+            "'The spec will slow us down' ignores the rework a short spec prevents. 'The user knows what they want' ignores implicit assumptions that must be surfaced.",
+            "Any changed decision or scope requires updating the spec first, invalidating affected downstream approvals, and repeating the relevant review before implementation."
+          ]
+        },
+        "review_spec": {
+          "step1": "sys.io.confirm('Approve the saved specification for this module, artifact, and revision, including success criteria and open questions, in this later human turn?', options=['approve', 'reject', 'modify']) -> spec_decision",
+          "step2": "sys.assert('spec_decision == \"approve\"', 'Specification must be approved before planning')",
+          "step3": "sys.state.set('spec_decision', spec_decision)",
+          "step4": "Record the actual human approval with this module, specification artifact revision, and approval turn. Confirm that the specification-writing turn already ended and the approval occurred in a later turn before handing off to planning.",
+          "output_mapping": "spec_decision",
+          "execute_mode": "inline",
+          "constraints": [
+            "Approval must bind to the displayed current-module spec artifact and revision and arrive after the saved-spec turn. Prior-module approval, stale revision approval, inferred consent, or asking and immediately proceeding in one turn is invalid.",
+            "On reject or modify, do not plan or code. A generic agent ends its turn, revises the spec, and repeats the saved-spec/later-turn approval boundary. A conforming runtime must stop on failed assertion; headless confirmation must fail with confirm_timeout and must never auto-approve."
+          ]
+        },
+        "plan": {
+          "step1": "Load the approved current-module specification and invoke planning-and-task-breakdown for dependency-graph mapping and vertical slicing; that skill is the canonical source of planning mechanics and takes precedence if this summary diverges.",
+          "step2": "Produce a reviewable technical plan: major components and dependencies, implementation order, risks and mitigations, parallel versus sequential work, and verification checkpoints between phases. Keep the approach within the approved spec or surface scope changes for renewed review.",
+          "step3": "Create tasks/ if needed and save the plan at tasks/plan.md. Track module and spec revision explicitly so downstream commands select the intended work. Prepare the task list target defined by planning-and-task-breakdown: tasks/todo.md by default or a project-designated external tracker.",
+          "output_mapping": "implementation_plan_revision",
+          "execute_mode": "inline"
+        },
+        "review_plan": {
+          "step1": "sys.io.confirm('Approve the implementation plan for this module, plan artifact and revision, and approved specification revision?', options=['approve', 'reject', 'modify']) -> plan_decision",
+          "step2": "sys.assert('plan_decision == \"approve\"', 'Implementation plan must be approved before task breakdown')",
+          "step3": "sys.state.set('plan_decision', plan_decision)",
+          "step4": "Record the actual human approval bound to the current module, plan artifact revision, and approved spec revision.",
+          "output_mapping": "plan_decision",
+          "execute_mode": "inline",
+          "constraints": [
+            "Only explicit human approval of the displayed current plan is valid; do not reuse another module's or revision's approval. A spec revision change invalidates this approval.",
+            "On reject or modify, do not advance. A generic agent ends its turn, revises the plan, and requests fresh approval. A conforming runtime must stop on failed assertion; headless confirmation must fail with confirm_timeout and must never auto-approve."
+          ]
+        },
+        "tasks": {
+          "step1": "Invoke planning-and-task-breakdown for full task-sizing and dependency-ordering mechanics; its rules take precedence over this lightweight summary.",
+          "step2": "Break the approved plan into discrete tasks, each completable in one focused session, with explicit acceptance criteria, a verification step such as test/build/manual check, and the files to touch. Order by dependency, not perceived importance; a task should not require changing more than about five files.",
+          "step3": "Record tasks in the designated task list target (default tasks/todo.md, or the project's external tracker). Use Task / Acceptance / Verify / Files entries, retain module and approved-plan revision context, and present the list for human review.",
+          "output_mapping": "task_list_revision",
+          "execute_mode": "inline"
+        },
+        "review_tasks": {
+          "step1": "sys.io.confirm('Approve the task list for this module, task artifact and revision, and approved plan revision?', options=['approve', 'reject', 'modify']) -> tasks_decision",
+          "step2": "sys.assert('tasks_decision == \"approve\"', 'Task list must be approved before implementation')",
+          "step3": "sys.state.set('tasks_decision', tasks_decision)",
+          "step4": "Record the actual human approval bound to the current module, task list artifact revision, and approved plan revision.",
+          "output_mapping": "tasks_decision",
+          "execute_mode": "inline",
+          "constraints": [
+            "Only explicit human approval of the displayed current task list is valid; do not reuse another module's or revision's approval. Changed spec or plan revisions invalidate affected task approval.",
+            "On reject or modify, do not implement. A generic agent ends its turn, revises the tasks, and requests fresh approval. A conforming runtime must stop on failed assertion; headless confirmation must fail with confirm_timeout and must never auto-approve."
+          ]
+        },
+        "implement": {
+          "step1": "Before coding, confirm the spec covers all six core areas; the human approved this module and revision in a later turn after saving; success criteria are specific and testable; Always/Ask first/Never boundaries exist; the spec is saved in the repository; any multi-capability map was approved before module specs; and each module spec traces to its approved stable module id.",
+          "step2": "Execute tasks one at a time with incremental-implementation and test-driven-development. Use context-engineering to load relevant spec sections and source files at each step instead of flooding context with the whole spec. Carry current module, artifact revisions, approval evidence, task acceptance criteria, and verification commands through handoffs.",
+          "step3": "Keep the spec alive: update it before implementing changed decisions, data models, or added/cut scope; invalidate affected approvals and return to the appropriate reviewed phase. Keep the spec in version control alongside code and link each eventual PR to the spec sections it implements, following the project's commit and publication policy.",
+          "output_mapping": "implementation_evidence",
+          "execute_mode": "inline",
+          "constraints": [
+            "'Requirements will change anyway' is why the spec is living, not permission to ignore it; reflect changes rather than letting implementation drift.",
+            "Stop on red flags: code with no written requirements; starting before clarifying done; features absent from spec or tasks; undocumented architectural decisions; skipping an obvious spec; planning or coding in the spec-writing turn; one spec spanning independent capabilities; or module boundaries/build order decided implicitly without an approved map."
+          ]
+        },
+        "verify": {
+          "step1": "Run the current task and module verification methods from the approved spec and task list. Collect observed test/build/manual-check results against explicit acceptance and success criteria; state failures and missing evidence rather than claiming completion from an intended command.",
+          "step2": "Check that implemented scope and architectural decisions match the living approved spec, no boundary was crossed without required approval, and module/interface dependencies follow the map. Confirm incremental/TDD evidence and relevant context handoffs. If a decision or scope changed, revise the spec and obtain affected approvals before further implementation.",
+          "step3": "Present the implementation and verification evidence to the human for the Implement phase review. Identify unresolved questions, incomplete tasks, and any proposed follow-up without silently including extra scope.",
+          "output_mapping": "verification_evidence",
+          "execute_mode": "inline"
+        },
+        "review_result": {
+          "step1": "sys.io.confirm('Approve the implementation results and verification evidence for this module and the reviewed spec, plan, and task revisions?', options=['approve', 'reject', 'modify']) -> result_decision",
+          "step2": "sys.assert('result_decision == \"approve\"', 'Implementation results must be reviewed before advancing or declaring completion')",
+          "step3": "sys.state.set('result_decision', result_decision)",
+          "step4": "Record the actual human review of the current module's result and evidence. Only mark the module complete when its approved success criteria have verification evidence.",
+          "output_mapping": "result_decision",
+          "execute_mode": "inline",
+          "constraints": [
+            "Approval binds to this module's current result and artifact revisions; it is not approval to ship, push, merge, or publish. No old or other-module approval counts.",
+            "On reject or modify, do not advance or claim completion. A generic agent ends its turn, addresses feedback through the relevant reviewed phases, and requests fresh approval. A conforming runtime must stop on failed assertion; headless confirmation must fail with confirm_timeout and must never auto-approve."
+          ]
+        },
+        "next_module": {
+          "step1": "For a single capability or a completed approved map, return done. Otherwise select the next unfinished module in dependency order from the same approved map, confirm prerequisites are complete, and return more.",
+          "step2": "For more, initialize fresh current-module artifact revisions and approval records before returning to Specify. Use the stable module id and its SPEC-<module-id>.md or designated external artifact; never reuse the preceding module's approvals or guess filenames.",
+          "output_mapping": "module_progress",
+          "execute_mode": "inline"
+        },
+        "end": {
+          "step1": "Return the reviewed outcome, module and spec traceability, verified success criteria, and any remaining limitations. This experimental declaration does not establish runtime enforcement: a generic Agent Skills host follows it on a best-effort basis; hard confirm/assert/dispatch/tool guarantees require a conforming AISP/AISOP runtime and independent execution evidence.",
+          "execute_mode": "inline"
+        }
+      }
+    }
+  }
+]

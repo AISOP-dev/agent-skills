@@ -67,6 +67,8 @@ Candidate results and projected execution traces are isolated under `evals/resul
 
 Replace `path/to/candidate` with the selected bundle directory. The loader accepts only confined repository paths and rejects escaping paths, duplicate file entries, and symlinks or directory junctions. It does not stage production shared references; see [#584](https://github.com/addyosmani/agent-skills/issues/584) for that separate loading limitation. It is not a historical recording or regrading mode.
 
+[The issue 309 pilot](../experiments/309/README.md) supplies one such candidate and documents its measured comparison and runtime boundaries.
+
 ## Offline runner regression coverage
 
 The runner dispatches in `scripts/run-evals.js`. Its helpers separate workspace and candidate loading (`scripts/lib/eval-workspace.js`), evidence and grading policy (`scripts/lib/eval-evidence.js`), and filesystem checks and atomic artifact writes (`scripts/lib/eval-files.js`).
