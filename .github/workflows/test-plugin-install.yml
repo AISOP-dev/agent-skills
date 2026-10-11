@@ -32,7 +32,10 @@ jobs:
         run: node --test scripts/validate-versions-test.js
 
       - name: Test skill eval runner
-        run: node --test scripts/run-evals-test.js
+        run: node --test scripts/run-evals-test.js scripts/run-evals-boundary-test.js
+
+      - name: Test eval privacy controls offline
+        run: node --test scripts/run-evals-privacy-test.js
 
       - name: Run skill evals (trigger + routing)
         run: node scripts/run-evals.js --min-rank1 95
@@ -96,6 +99,8 @@ jobs:
           scripts/lib/skill-lint-test.js
           scripts/validate-versions-test.js
           scripts/run-evals-test.js
+          scripts/run-evals-boundary-test.js
+          scripts/run-evals-privacy-test.js
           scripts/validate-reference-links-test.js
           scripts/validate-commands-test.js
           scripts/validate-artifact-paths-test.js

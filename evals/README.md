@@ -33,9 +33,53 @@ node scripts/run-evals.js --behavioral test-driven-development            # spen
 node scripts/run-evals.js --behavioral test-driven-development --dry-run  # prints the plan only
 ```
 
-Tier 3 supports two behavioral artifact kinds. `execution` is the default: each eval runs in a throwaway git repository, real project inputs from `files[]` are materialized out of `evals/fixtures/` and committed as the baseline, and the grader judges the full `--output-format stream-json --verbose` execution trace, including tool calls. `dialogue` is reserved for skills whose deliverable is the conversation itself; it needs no fixture, and the grader judges the assistant's conversational turns without requiring file edits or commands. Claiming `dialogue` is a human-reviewed exemption, not a general escape hatch for execution skills.
+Tier 3 supports two behavioral artifact kinds. `execution` is the default: each eval runs in a throwaway git repository, project inputs from `files[]` are materialized out of `evals/fixtures/` and committed as the baseline, and the grader judges selected execution evidence, including tool calls. `dialogue` is reserved for skills whose deliverable is the conversation itself; it needs no fixture, and the grader judges the assistant's conversational turns without requiring file edits or commands. When a dialogue case declares `files[]`, those inputs are materialized too. Claiming `dialogue` is a human-reviewed exemption, not a general escape hatch for execution skills.
 
-The executor runs with an explicit permission mode (`--permission-mode acceptEdits` plus a pre-approved tool list) so execution evals can genuinely edit files, run commands, inspect diffs, and make commits rather than being denied and narrating instead. Traces are fenced as untrusted data in the grader prompt and piped to the grader over stdin (they can be megabytes; argv would hit the OS argument-size limit), executor and grader calls carry timeouts, and grader output is validated as JSON before being written to `evals/results/` (gitignored) in skill-creator's `grading.json` shape. Discipline skills also include pressure cases for time pressure, sunk cost, and authority pressure; these verify that the workflow still holds when the prompt argues for skipping it.
+The executor runs with an explicit permission mode (`--permission-mode acceptEdits` plus a pre-approved tool list) so execution evals can edit files, run commands, inspect diffs, and make commits. Fixture Git setup uses an empty template, disables hooks locally, and ignores host Git configuration and `GIT_*` redirection variables; it does not change personal configuration. All grader input passes through an allowlisted, redacted projection of the expectations and execution or dialogue evidence. That projection omits unnecessary CLI/session metadata, redacts local paths and recognized credential patterns, and is fenced as untrusted data and passed over stdin. Short known private configuration names and their case variants are also filtered. The grader runs from a separate empty temporary directory with its file and command tools disabled (`--tools ''`). Executor and grader calls carry timeouts.
+
+Empty execution output, reported executor failures, and malformed error states produce static diagnostics without starting a grader. A failed individual tool call can still be graded as part of an otherwise completed execution. Unknown options, duplicate options, and extra positional arguments are rejected before execution; a misspelled `--dry-run` is an error.
+
+The complete behavioral case is validated before CLI version probing or result-slot changes: case identity, nonempty prompts and expectations, expected output, kind, fixture lists, and unique nonnegative IDs must be valid. Provisional execution cases cannot run. Case files, baseline instructions, the fixture root, and selected inputs must remain within the checkout without linked ancestors or hardlinked files. An invalid later evaluation therefore cannot run an earlier one or clear its saved result.
+
+Version probing, execution, and grading receive an environment that removes inherited Git repository/index/template redirection and disables personal Git configuration. Other CLI configuration, including explicit model selection, remains available. This isolates Git behavior and does not establish a complete model sandbox.
+
+Fixture paths and selected trees must not traverse symlinks or junctions, contain hardlinked files, or supply `.git` metadata at any depth (case-insensitive). Working-tree patches are parsed with Git to reject symbolic-link modes on every host, and their realized trees are checked again before execution. Empty or fully ignored fixture trees still receive an empty baseline commit. Fixture selectors accept either slash convention on every host, while rejecting drive-relative paths, device names, alternate data streams, and trailing-dot or trailing-space aliases. Selected trees also require portable filenames. Result directories and files are checked again after execution and before writes; linked destinations are rejected. Artifact writes use owner-only temporary files where supported and atomic replacement, so an interrupted write cannot publish a partial grading file. The runner owns temporary directories before population starts, so setup failures still reach cleanup. Cleanup failures make the run fail and retain a static diagnostic; a prior setup or execution failure is preserved when cleanup also fails. These filesystem checks do not establish isolation against a concurrent hostile process.
+
+Accepted grading is validated, projected, and redacted before being written to gitignored `evals/results/` in skill-creator's `grading.json` shape. Invalid grader responses produce only a generic `grading.error.json`; the runner does not save the raw response or offer a raw-trace retention opt-in. Both executor and grader calls request that the CLI not save local sessions (`--no-session-persistence`). These controls do not govern provider retention or make Claude Code a complete sandbox: it may still supply automatic configuration or context, and executor tools remain available. Prompts, bridge text, and files the executor reads can reach the model provider. Existing historical logs are not retroactively removed. Review inputs before opting in; redaction cannot recognize every confidential passage, and Git ignore does not prevent model transmission. Discipline skills also include cases for time pressure, sunk cost, and authority pressure to test whether the workflow holds when the prompt argues for skipping it.
+
+### Alternate skill bundles
+
+To compare the same behavioral cases against an isolated, self-contained candidate, pass `--skill-dir` with a repository-relative directory containing a matching `SKILL.md` and a required `eval-bundle.json` file list:
+
+```bash
+node scripts/run-evals.js --behavioral spec-driven-development --skill-dir path/to/candidate --dry-run
+```
+
+For example, a self-contained candidate can declare:
+
+```json
+{"files":["SKILL.md","README.md","program.json"]}
+```
+
+The list must include `SKILL.md` and contain individual allowed text files with portable names, not directories or globs. Case JSON and manifest JSON accept an optional UTF-8 BOM; baseline and candidate frontmatter also support BOM, CRLF, and quoted skill names. The runner stages only those files under `.eval-skills/<skill>` in the temporary workspace, excludes them from fixture Git evidence, and supplies relative installed paths alongside the bridge text. Both fixture and candidate copies transfer file contents without hidden NTFS alternate data streams. The manifest itself is evaluation transport metadata and is not copied. Unlisted files are not staged. Supporting files are read on demand rather than injected into the system prompt.
+
+Candidate results and projected execution traces are isolated under `evals/results/skill-dir/<source-directory>/`. The trace uses the same allowlisted, redacted projection supplied to the grader; raw CLI output is not persisted. Run metadata records relative source and installed paths, CLI version, and observed executor model. A recorded read proves loading, not compliance with the file's instructions. Treat even projected results as reviewable data before publishing them.
+
+Replace `path/to/candidate` with the selected bundle directory. The loader accepts only confined repository paths and rejects escaping paths, duplicate file entries, and symlinks or directory junctions. It does not stage production shared references; see [#584](https://github.com/addyosmani/agent-skills/issues/584) for that separate loading limitation. It is not a historical recording or regrading mode.
+
+## Offline runner regression coverage
+
+The runner dispatches in `scripts/run-evals.js`. Its helpers separate workspace and candidate loading (`scripts/lib/eval-workspace.js`), evidence and grading policy (`scripts/lib/eval-evidence.js`), and filesystem checks and atomic artifact writes (`scripts/lib/eval-files.js`).
+
+Run the offline regressions with Node.js 24:
+
+```bash
+node --test scripts/run-evals-test.js scripts/run-evals-boundary-test.js scripts/run-evals-privacy-test.js
+```
+
+Tests intercept every Claude operation, including version probing, and use artificial responses. They cover both baseline and candidate paths: schema preflight before side effects; strict CLI options; portable fixture paths and binary copies; BOM/CRLF input; nested Git metadata, linked inputs and destinations, and Windows alternate streams; declared dialogue fixtures; Git environment isolation; cleanup and atomic-write failures; gradeability and strict grading validation; and redaction across grader input, traces, and saved reports. Long redaction inputs run in local Node subprocesses with a five-second limit. URL email filtering also classifies percent-encoded values, including malformed UTF-8 escapes, and removes the whole private component while keeping public host and parameter names. Dotted credential parameter names are filtered without consuming unrelated query fields. A negative routing owner must strictly outscore the tested skill; an alphabetical tie does not pass.
+
+These tests verify local transport and failure handling. They do not establish live CLI compatibility, provider retention controls, or a complete sandbox.
 
 ## Plugin evals (Claude Code)
 
@@ -88,7 +132,7 @@ One file per skill: `evals/cases/<skill-name>.json`.
 ```
 
 - `evals[]` uses skill-creator's core schema (`id`, `prompt`, `expected_output`, optional `files[]`, `expectations[]`) plus this repository's optional `kind`. `kind` must be `execution` or `dialogue` and defaults to `execution` for compatibility. Execution evals require non-empty `files[]`; paths are relative to `evals/fixtures/` and may name a file or project directory. Dialogue evals may omit `files[]` because the transcript is the artifact. Expectations are verifiable statements a grader checks against the relevant artifact — behaviors, not phrasings.
-- `trigger` is this repo's extension. `positive` prompts are realistic user asks that should route here (`top_k` defaults to 3; tighten to 1 for a skill's signature ask). `negative` prompts belong to a *different* skill; this skill must not rank first for them. Declare that skill in `owner` where you can: the runner then asserts the owner **outranks** this skill, turning the negative into a real pairwise routing test instead of one that can pass vacuously when the prompt matches nothing.
+- `trigger` is this repo's extension. `positive` prompts are realistic user asks that should route here (`top_k` defaults to 3 and must be a positive safe integer; tighten to 1 for a skill's signature ask). `negative` prompts belong to a *different* skill; this skill must not rank first for them. Declare that skill in `owner` where you can: it must be a nonempty skill identifier, and its score must be **strictly greater** than this skill's score. Equal scores do not pass because of sort order; prompts that match nothing do not pass vacuously.
 
 **Writing good trigger prompts:** paraphrase how users actually talk; don't copy the description (that's gaming the eval). If a realistic prompt can't rank because the description lacks its vocabulary, that is a real finding — improve the description.
 

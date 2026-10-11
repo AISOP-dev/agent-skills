@@ -8,9 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
-const { materializeWorkspace, parseGrading, clearGradingSlot, persistGradingOutcome, extractExecutorModel } = require('./run-evals');
-
-const RUNNER = path.join(__dirname, 'run-evals.js');
+const { materializeWorkspace, parseGrading, clearGradingSlot, persistGradingOutcome, extractExecutorModel, redactEvidenceText } = require('./run-evals');
 
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -55,7 +53,11 @@ function makeSandbox() {
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(root, 'evals', 'cases'), { recursive: true });
   fs.mkdirSync(path.join(root, 'evals', 'fixtures', 'project'), { recursive: true });
-  fs.copyFileSync(RUNNER, path.join(root, 'scripts', 'run-evals.js'));
+  for (const relative of ['scripts/run-evals.js', 'scripts/lib/eval-workspace.js', 'scripts/lib/eval-evidence.js', 'scripts/lib/eval-files.js']) {
+    const destination = path.join(root, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(path.join(__dirname, '..', relative), destination);
+  }
   fs.writeFileSync(path.join(root, 'evals', 'fixtures', 'project', 'context.txt'), 'fixture\n');
   return root;
 }
@@ -64,6 +66,52 @@ function run(root, args = []) {
   return spawnSync(process.execPath, [path.join(root, 'scripts', 'run-evals.js'), ...args], {
     cwd: root,
     encoding: 'utf8',
+  });
+}
+
+test('malformed case JSON reports no excerpt of the input', () => {
+  const root = makeSandbox();
+  try {
+    writeSkill(root, 'alpha-skill', 'Handles alpha widgets. Use when changing alpha widgets.');
+    fs.writeFileSync(path.join(root, 'evals', 'cases', 'alpha-skill.json'), 'PRIVATEKEY');
+    const result = run(root);
+    assert.equal(result.status, 1);
+    assert.ok(!`${result.stdout}${result.stderr}`.includes('PRIVATEKEY'), 'JSON syntax errors can embed raw confidential input');
+    assert.match(result.stdout, /invalid JSON/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('deterministic routing diagnostics redact private prompt values', () => {
+  const root = makeSandbox();
+  try {
+    writeSkill(root, 'alpha-skill', 'Handles alpha widgets. Use when changing alpha widgets.');
+    const evalCase = completeCase('alpha-skill', 'Contact fictional-user@example.invalid with MY_API_KEY=fictionalOpaqueCredentialValue');
+    writeJson(path.join(root, 'evals', 'cases', 'alpha-skill.json'), evalCase);
+    const result = run(root);
+    assert.equal(result.status, 1, 'an unrelated private prompt must fail routing');
+    const diagnostics = result.stdout + result.stderr;
+    assert.ok(!diagnostics.includes('fictional-user@example.invalid'));
+    assert.ok(!diagnostics.includes('fictionalOpaqueCredentialValue'));
+    assert.match(diagnostics, /description shares no vocabulary/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const [label, malformed] of [
+  ['null case', null],
+  ['non-array evals', { ...completeCase('alpha-skill', 'change alpha widget'), evals: {} }],
+  ['null eval', { ...completeCase('alpha-skill', 'change alpha widget'), evals: [null] }],
+  ['non-array positive triggers', { ...completeCase('alpha-skill', 'change alpha widget'), trigger: { positive: {}, negative: [] } }],
+]) {
+  test(`deterministic validation rejects ${label} without a private stack trace`, () => {
+    const root = makeSandbox();
+    try {
+      writeSkill(root, 'alpha-skill', 'Handles alpha widgets. Use when changing alpha widgets.');
+      writeJson(path.join(root, 'evals', 'cases', 'alpha-skill.json'), malformed);
+      const result = run(root);
+      assert.equal(result.status, 1);
+      assert.ok(!result.stderr.includes(root), 'malformed input must not cause a stack trace with a local directory');
+      assert.match(result.stdout, /schema/);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 }
 
@@ -434,16 +482,17 @@ test('replaces paraphrased grader text with the declared expectation', () => {
 
 // ---------- persistGradingOutcome stale-cleanup tests ----------
 
-test('rejected grading writes raw output', () => {
+test('rejected grading writes a generic diagnostic without retaining raw output', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'grading-cleanup-'));
   try {
     const base = path.join(dir, 'my-skill.eval-1');
 
-    const result = persistGradingOutcome(base, null, 'unparseable grader output');
+    const result = persistGradingOutcome(base, parseGrading('unparseable grader output', ['x']));
 
     assert.equal(result, false);
-    assert.equal(fs.existsSync(`${base}.grading.raw.txt`), true, 'raw output must be written');
-    assert.equal(fs.readFileSync(`${base}.grading.raw.txt`, 'utf8'), 'unparseable grader output');
+    assert.equal(fs.existsSync(`${base}.grading.raw.txt`), false, 'raw output must not be written');
+    assert.deepEqual(JSON.parse(fs.readFileSync(`${base}.grading.error.json`, 'utf8')),
+      { error: 'invalid_grading', raw_output_retained: false });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -454,13 +503,36 @@ test('rejected grading succeeds even when no prior grading.json exists', () => {
   try {
     const base = path.join(dir, 'my-skill.eval-1');
 
-    const result = persistGradingOutcome(base, null, 'bad output');
+    const result = persistGradingOutcome(base, parseGrading('bad output', ['x']));
 
     assert.equal(result, false);
-    assert.equal(fs.existsSync(`${base}.grading.raw.txt`), true);
+    assert.equal(fs.existsSync(`${base}.grading.raw.txt`), false);
+    assert.equal(fs.existsSync(`${base}.grading.error.json`), true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('grader projection excludes unrequested fields at every level', () => {
+  const grading = {
+    expectations: [{ id: 1, text: 'expected', passed: true, evidence: 'observed', private_note: 'fictional-private-note' }],
+    summary: { passed: 1, failed: 0, total: 1, pass_rate: 1, session_id: 'fictional-session' },
+    account: 'fictional-account',
+  };
+  const parsed = parseGrading(JSON.stringify(grading), ['expected']);
+  assert.deepEqual(Object.keys(parsed).sort(), ['expectations', 'summary']);
+  assert.deepEqual(Object.keys(parsed.expectations[0]).sort(), ['evidence', 'id', 'passed', 'text']);
+  assert.deepEqual(Object.keys(parsed.summary).sort(), ['failed', 'pass_rate', 'passed', 'total']);
+});
+
+test('redacts URL userinfo and short authorization credentials in command evidence', () => {
+  // These are deliberately fictional values, never account credentials.
+  const context = { homeDirectory: '/home/fictional-private-user', username: 'fictional-private-user' };
+  const url = redactEvidenceText('Fetch https://fictional-login:fictional-pass@service.example.invalid/public', context);
+  assert.ok(!url.includes('fictional-login') && !url.includes('fictional-pass'), 'URL login and password must be withheld');
+  assert.ok(url.includes('service.example.invalid/public'), 'the public request destination must remain visible');
+  const command = redactEvidenceText('curl -H "Authorization: Basic YTpi" https://service.example.invalid', context);
+  assert.ok(!command.includes('YTpi'), 'short header credentials must not bypass the text filter');
 });
 
 test('accepted grading writes grading.json', () => {
@@ -472,7 +544,7 @@ test('accepted grading writes grading.json', () => {
       summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 },
     };
 
-    const result = persistGradingOutcome(base, grading, 'unused');
+    const result = persistGradingOutcome(base, grading);
 
     assert.equal(result, true);
     const written = JSON.parse(fs.readFileSync(`${base}.grading.json`, 'utf8'));
@@ -491,13 +563,15 @@ test('a grader that throws leaves no result file behind', () => {
     // Stale files from a prior run
     fs.writeFileSync(`${base}.grading.json`, '{"previous":"run"}\n');
     fs.writeFileSync(`${base}.grading.raw.txt`, 'previous raw output');
+    fs.writeFileSync(`${base}.trace.jsonl`, 'previous trace');
 
-    clearGradingSlot(base);
+    clearGradingSlot(base, true);
 
     // Executor or grader crashes — persistGradingOutcome is never called
 
     assert.equal(fs.existsSync(`${base}.grading.json`), false, 'stale grading.json must not survive a crash');
     assert.equal(fs.existsSync(`${base}.grading.raw.txt`), false, 'stale grading.raw.txt must not survive a crash');
+    assert.equal(fs.existsSync(`${base}.trace.jsonl`), false, 'stale execution trace must not survive a crash');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -517,7 +591,7 @@ test('successful grading leaves no stale raw file behind', () => {
       expectations: [{ id: 1, text: 'x', passed: true, evidence: 'y' }],
       summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 },
     };
-    persistGradingOutcome(base, grading, 'unused');
+    persistGradingOutcome(base, grading);
 
     assert.equal(fs.existsSync(`${base}.grading.json`), true, 'grading.json must be written');
     assert.equal(fs.existsSync(`${base}.grading.raw.txt`), false, 'stale grading.raw.txt must not survive');
@@ -578,7 +652,7 @@ test('accepted grading includes run metadata when provided', () => {
       timestamp: '2026-09-21T00:00:00.000Z',
     };
 
-    persistGradingOutcome(base, grading, 'unused', runMeta);
+    persistGradingOutcome(base, grading, runMeta);
 
     const written = JSON.parse(fs.readFileSync(`${base}.grading.json`, 'utf8'));
     assert.deepEqual(written.run, runMeta);
@@ -598,7 +672,7 @@ test('accepted grading omits run key when no metadata is provided', () => {
       summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 },
     };
 
-    persistGradingOutcome(base, grading, 'unused');
+    persistGradingOutcome(base, grading);
 
     const written = JSON.parse(fs.readFileSync(`${base}.grading.json`, 'utf8'));
     assert.equal('run' in written, false);
@@ -619,6 +693,80 @@ test('materializes a git baseline and applies a working-tree patch', () => {
     assert.equal(fs.existsSync(path.join(workspace, '.eval')), false);
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('refuses fixture-supplied root Git metadata before repository initialization', () => {
+  const root = makeSandbox();
+  let workspace;
+  try {
+    fs.mkdirSync(path.join(root, 'evals', 'fixtures', '.git'));
+    fs.writeFileSync(path.join(root, 'evals', 'fixtures', '.git', 'config'), '');
+    const runner = require(path.join(root, 'scripts', 'run-evals.js'));
+    for (const selector of ['.git', './.git', 'folder/../.git']) {
+      assert.throws(() => { workspace = runner.materializeWorkspace(behavioralEval(['project/context.txt', selector])); },
+        /reserved.*\.git/);
+    }
+  } finally {
+    if (workspace) fs.rmSync(workspace, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('does not overwrite a grading file that is hardlinked to another record', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grading-linked-test-'));
+  try {
+    const original = path.join(root, 'unrelated-record.json');
+    const base = path.join(root, 'alpha.eval-1');
+    fs.writeFileSync(original, 'FICTIONAL_UNRELATED_RECORD\n');
+    fs.linkSync(original, `${base}.grading.json`);
+    const grading = {
+      expectations: [{ id: 1, text: 'expected', passed: true, evidence: 'observed' }],
+      summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 },
+    };
+    assert.throws(() => persistGradingOutcome(base, grading), /linked|unsafe/i);
+    assert.equal(fs.readFileSync(original, 'utf8'), 'FICTIONAL_UNRELATED_RECORD\n');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an interrupted artifact replacement preserves the prior record and removes its temporary file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grading-atomic-test-'));
+  const rename = fs.renameSync;
+  try {
+    const { writeEvalArtifact } = require('./lib/eval-files');
+    const file = path.join(root, 'grade.json');
+    fs.writeFileSync(file, 'PRIOR_FICTIONAL_RECORD\n');
+    fs.renameSync = () => { throw new Error('Simulated replacement failure'); };
+    assert.throws(() => writeEvalArtifact(file, 'NEXT_FICTIONAL_RECORD\n'), /Simulated replacement failure/);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'PRIOR_FICTIONAL_RECORD\n');
+    assert.deepEqual(fs.readdirSync(root), ['grade.json']);
+  } finally {
+    fs.renameSync = rename;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an exclusive artifact-open collision does not delete a file created by another writer', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grading-collision-test-'));
+  const open = fs.openSync;
+  const write = fs.writeFileSync;
+  let collision;
+  try {
+    const { writeEvalArtifact } = require('./lib/eval-files');
+    fs.openSync = (file, flags, mode) => {
+      if (flags !== 'wx') return open(file, flags, mode);
+      collision = file;
+      write(file, 'FICTIONAL_COMPETING_WRITER\n');
+      const error = new Error('Simulated exclusive-open collision');
+      error.code = 'EEXIST';
+      throw error;
+    };
+    assert.throws(() => writeEvalArtifact(path.join(root, 'grade.json'), 'NEXT_FICTIONAL_RECORD\n'), /collision/);
+    assert.equal(fs.readFileSync(collision, 'utf8'), 'FICTIONAL_COMPETING_WRITER\n');
+    assert.equal(fs.existsSync(path.join(root, 'grade.json')), false);
+  } finally {
+    fs.openSync = open;
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -688,3 +836,282 @@ test('removes the throwaway workspace when fixture setup fails', () => {
     fs.rmSync(temp, { recursive: true, force: true });
   }
 });
+
+// Candidate bundles are opt-in; the same independent cases exercise the
+// installed bridge and its supporting files instead of embedding the JSON.
+function writeCandidate(root, name = 'alpha-skill') {
+  const relative = 'experiments/candidate';
+  const directory = path.join(root, relative);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'SKILL.md'),
+    `---\nname: ${name}\ndescription: Handles alpha widgets. Use when changing alpha widgets.\n---\n\nRead program.json relative to this skill directory.\n`);
+  writeJson(path.join(directory, 'program.json'), { instruction: 'canonical-only-marker' });
+  writeJson(path.join(directory, 'eval-bundle.json'), { files: ['SKILL.md', 'program.json'] });
+  writeSkill(root, 'alpha-skill', 'Handles alpha widgets. Use when changing alpha widgets.');
+  writeJson(path.join(root, 'evals', 'cases', 'alpha-skill.json'),
+    completeCase('alpha-skill', 'change alpha widget'));
+  return relative;
+}
+
+test('--skill-dir requires behavioral mode and exactly one directory value', () => {
+  const root = makeSandbox();
+  try {
+    const relative = writeCandidate(root);
+    for (const args of [
+      ['--skill-dir', relative],
+      ['--behavioral', 'alpha-skill', '--skill-dir', '--dry-run'],
+      ['--behavioral', 'alpha-skill', '--skill-dir', relative, '--skill-dir', relative, '--dry-run'],
+    ]) {
+      const result = run(root, args);
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stderr, /--skill-dir/);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('candidate dry-run identifies its isolated source and results; baseline stays unchanged', () => {
+  const root = makeSandbox();
+  try {
+    const relative = writeCandidate(root);
+    const candidate = run(root, ['--behavioral', 'alpha-skill', '--skill-dir', relative, '--dry-run']);
+    assert.equal(candidate.status, 0, candidate.stdout + candidate.stderr);
+    assert.match(candidate.stdout, /experiments\/candidate\/SKILL\.md/);
+    assert.match(candidate.stdout, /evals\/results\/skill-dir\/experiments\/candidate/);
+    assert.match(candidate.stdout, /\.eval-skills\/alpha-skill/);
+    assert.equal(fs.existsSync(path.join(root, 'evals', 'results')), false);
+    const baseline = run(root, ['--behavioral', 'alpha-skill', '--dry-run']);
+    assert.equal(baseline.status, 0, baseline.stdout + baseline.stderr);
+    assert.match(baseline.stdout, /<alpha-skill\/SKILL\.md>/);
+    assert.doesNotMatch(baseline.stdout, /skill-dir|\.eval-skills|experiments\/candidate/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('loads candidate frontmatter with a UTF-8 BOM and CRLF line endings', () => {
+  const root = makeSandbox();
+  try {
+    const relative = writeCandidate(root);
+    const file = path.join(root, relative, 'SKILL.md');
+    const content = fs.readFileSync(file, 'utf8');
+    fs.writeFileSync(file, `\uFEFF${content.replace(/\n/g, '\r\n')}`);
+    const result = run(root, ['--behavioral', 'alpha-skill', '--skill-dir', relative, '--dry-run']);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /experiments\/candidate\/SKILL\.md/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('rejects escaping, missing, and mismatched candidate directories before execution', () => {
+  const root = makeSandbox();
+  try {
+    const relative = writeCandidate(root, 'different-skill');
+    for (const [directory, error] of [
+      ['../outside', /relative|escape/],
+      [path.resolve(root, relative), /relative/],
+      ['missing', /directory|ENOENT/],
+      [relative, /name.*alpha-skill/],
+    ]) {
+      const result = run(root, ['--behavioral', 'alpha-skill', '--skill-dir', directory, '--dry-run']);
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stderr, error);
+    }
+    fs.unlinkSync(path.join(root, relative, 'SKILL.md'));
+    const missing = run(root, ['--behavioral', 'alpha-skill', '--skill-dir', relative, '--dry-run']);
+    assert.equal(missing.status, 1, missing.stdout + missing.stderr);
+    assert.match(missing.stderr, /SKILL\.md/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('rejects a symlink in a candidate bundle and a symlinked candidate directory', () => {
+  const root = makeSandbox();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'candidate-outside-'));
+  try {
+    const relative = writeCandidate(root);
+    fs.symlinkSync(outside, path.join(root, relative, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+    const linkedFile = run(root, ['--behavioral', 'alpha-skill', '--skill-dir', relative, '--dry-run']);
+    assert.equal(linkedFile.status, 1, linkedFile.stdout + linkedFile.stderr);
+    assert.match(linkedFile.stderr, /symlink/);
+    fs.symlinkSync(outside, path.join(root, 'linked-candidate'), process.platform === 'win32' ? 'junction' : 'dir');
+    const linkedDir = run(root, ['--behavioral', 'alpha-skill', '--skill-dir', 'linked-candidate', '--dry-run']);
+    assert.equal(linkedDir.status, 1, linkedDir.stdout + linkedDir.stderr);
+    assert.match(linkedDir.stderr, /symlink|escape/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('materializes a relocated candidate bundle whose JSON can be read from the installed bridge path', () => {
+  const root = makeSandbox();
+  let workspace;
+  try {
+    const relative = writeCandidate(root);
+    const runner = require(path.join(root, 'scripts', 'run-evals.js'));
+    const bundle = runner.loadSkillBundle('alpha-skill', relative);
+    workspace = runner.materializeWorkspace(behavioralEval(), bundle);
+    const installed = path.join(workspace, '.eval-skills', 'alpha-skill', 'SKILL.md');
+    const canonical = JSON.parse(fs.readFileSync(path.join(path.dirname(installed), 'program.json'), 'utf8'));
+    assert.equal(canonical.instruction, 'canonical-only-marker');
+    const prompt = runner.skillSystemPrompt(installed, workspace);
+    assert.match(prompt, /Read program\.json/);
+    assert.ok(prompt.includes('.eval-skills/alpha-skill/SKILL.md'));
+    assert.ok(!prompt.includes(workspace), 'system prompt must omit the absolute workspace');
+    assert.doesNotMatch(prompt, /canonical-only-marker/);
+    const status = spawnSync('git', ['status', '--short'], { cwd: workspace, encoding: 'utf8' });
+    assert.equal(status.stdout, '', 'installed evaluation instructions must not pollute fixture changes');
+  } finally {
+    if (workspace) fs.rmSync(workspace, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('candidate staging copies only manifest files, excluding undeclared and hidden data', () => {
+  const root = makeSandbox();
+  let workspace;
+  try {
+    const relative = writeCandidate(root);
+    const directory = path.join(root, relative);
+    fs.writeFileSync(path.join(directory, '.env'), 'fictional-private-setting');
+    fs.writeFileSync(path.join(directory, 'unlisted.txt'), 'fictional-private-note');
+    const runner = require(path.join(root, 'scripts', 'run-evals.js'));
+    workspace = runner.materializeWorkspace(behavioralEval(), runner.loadSkillBundle('alpha-skill', relative));
+    assert.deepEqual(fs.readdirSync(path.join(workspace, '.eval-skills', 'alpha-skill')).sort(),
+      ['SKILL.md', 'program.json']);
+  } finally {
+    if (workspace) fs.rmSync(workspace, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('candidate manifests reject missing, escaping, duplicate, and sensitive entries', () => {
+  const root = makeSandbox();
+  try {
+    const relative = writeCandidate(root);
+    const directory = path.join(root, relative);
+    const runner = require(path.join(root, 'scripts', 'run-evals.js'));
+    fs.writeFileSync(path.join(directory, '.env'), 'fictional-private-setting');
+    fs.mkdirSync(path.join(directory, 'notes'));
+    fs.writeFileSync(path.join(directory, 'notes', 'credentials.json'), '{}');
+    for (const files of [
+      [], ['program.json'], ['SKILL.md', '../outside.md'],
+      ['SKILL.md', 'SKILL.md'], ['SKILL.md', '.env'],
+      ['SKILL.md', 'notes/credentials.json'], ['SKILL.md', 'notes'],
+      ['SKILL.md', 'missing.md'], ['SKILL.md', 'notes/../SKILL.md'],
+      ['SKILL.md', 'C:\\outside.md'],
+    ]) {
+      writeJson(path.join(directory, 'eval-bundle.json'), { files });
+      assert.throws(() => runner.loadSkillBundle('alpha-skill', relative));
+    }
+    fs.unlinkSync(path.join(directory, 'eval-bundle.json'));
+    assert.throws(() => runner.loadSkillBundle('alpha-skill', relative), /manifest|eval-bundle/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('rejects fixture data that pre-populates the reserved candidate directory', () => {
+  const root = makeSandbox();
+  let workspace;
+  try {
+    const relative = writeCandidate(root);
+    writeJson(path.join(root, 'evals', 'fixtures', '.eval-skills', 'alpha-skill', 'program.json'),
+      { instruction: 'forged-fixture' });
+    const runner = require(path.join(root, 'scripts', 'run-evals.js'));
+    const bundle = runner.loadSkillBundle('alpha-skill', relative);
+    assert.throws(() => {
+      workspace = runner.materializeWorkspace(behavioralEval(['.eval-skills']), bundle);
+    }, /reserved.*\.eval-skills/);
+  } finally {
+    if (workspace) fs.rmSync(workspace, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('candidate behavioral execution loads the installed package and records source and CLI version', () => {
+  const root = makeSandbox();
+  try {
+    const relative = writeCandidate(root);
+    const result = spawnSync(process.execPath, ['-e', `
+      const assert = require('node:assert/strict');
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const cp = require('node:child_process');
+      const original = cp.execFileSync;
+      cp.execFileSync = (command, args, options) => {
+        if (command !== 'claude') return original(command, args, options);
+        if (args.includes('--version')) return 'test-cli-version\\n';
+        const promptIndex = args.indexOf('--append-system-prompt');
+        if (promptIndex !== -1) {
+          const installed = path.join(options.cwd, '.eval-skills', 'alpha-skill', 'SKILL.md');
+          assert.ok(args[promptIndex + 1].includes('.eval-skills/alpha-skill/SKILL.md'));
+          assert.ok(!args[promptIndex + 1].includes(options.cwd));
+          assert.ok(!args[promptIndex + 1].includes('canonical-only-marker'));
+          const json = fs.readFileSync(path.join(path.dirname(installed), 'program.json'), 'utf8');
+          assert.ok(json.includes('canonical-only-marker'));
+          return [
+            JSON.stringify({ type: 'system', subtype: 'init', model: 'test-model' }),
+            JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Read fixture' }] } }),
+          ].join('\\n');
+        }
+        return JSON.stringify({
+          expectations: [{ id: 1, text: 'The attached project is inspected before reporting a result', passed: true, evidence: 'Read fixture' }],
+          summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 }
+        });
+      };
+      require(${JSON.stringify(path.join(root, 'scripts', 'run-evals.js'))}).runBehavioral('alpha-skill', false, ${JSON.stringify(relative)});
+    `], { cwd: root, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const file = path.join(root, 'evals', 'results', 'skill-dir', relative, 'alpha-skill.eval-1.grading.json');
+    const grading = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(grading.run.skill_path, `${relative}/SKILL.md`);
+    assert.equal(grading.run.claude_cli_version, 'test-cli-version');
+    assert.equal(grading.run.executor_model, 'test-model');
+    const trace = fs.readFileSync(file.replace('.grading.json', '.trace.jsonl'), 'utf8');
+    assert.ok(trace.includes('Read fixture'));
+    assert.ok(!trace.includes('init') && !trace.includes('test-model'));
+    assert.equal(grading.run.installed_skill_path, '.eval-skills/alpha-skill/SKILL.md');
+    assert.equal(fs.existsSync(path.join(root, 'evals', 'results', 'alpha-skill.eval-1.grading.json')), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const executionSucceeds of [false, true]) {
+  test(`version probe failure is best-effort when behavioral execution ${executionSucceeds ? 'succeeds' : 'fails'}`, () => {
+    const root = makeSandbox();
+    try {
+      const relative = writeCandidate(root);
+      const base = path.join(root, 'evals', 'results', 'skill-dir', relative, 'alpha-skill.eval-1');
+      fs.mkdirSync(path.dirname(base), { recursive: true });
+      fs.writeFileSync(`${base}.grading.json`, '{"previous":"run"}\n');
+      fs.writeFileSync(`${base}.trace.jsonl`, 'previous trace');
+      const result = spawnSync(process.execPath, ['-e', `
+        const cp = require('node:child_process');
+        const original = cp.execFileSync;
+        cp.execFileSync = (command, args, options) => {
+          if (command !== 'claude') return original(command, args, options);
+          if (args.includes('--version')) throw new Error('version probe unavailable');
+          if (args.includes('--append-system-prompt')) {
+            if (!${executionSucceeds}) throw new Error('executor unavailable');
+            return [
+              JSON.stringify({ type: 'system', subtype: 'init', model: 'test-model' }),
+              JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Read fixture' }] } }),
+            ].join('\\n');
+          }
+          return JSON.stringify({
+            expectations: [{ id: 1, text: 'The attached project is inspected before reporting a result', passed: true, evidence: 'Read fixture' }],
+            summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 }
+          });
+        };
+        require(${JSON.stringify(path.join(root, 'scripts', 'run-evals.js'))}).runBehavioral('alpha-skill', false, ${JSON.stringify(relative)});
+      `], { cwd: root, encoding: 'utf8' });
+      if (executionSucceeds) {
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        const grading = JSON.parse(fs.readFileSync(`${base}.grading.json`, 'utf8'));
+        assert.equal(grading.run.claude_cli_version, 'unknown');
+        assert.equal(grading.run.executor_model, 'test-model');
+        assert.equal(grading.summary.pass_rate, 1);
+        assert.doesNotMatch(fs.readFileSync(`${base}.trace.jsonl`, 'utf8'), /previous trace/);
+      } else {
+        assert.equal(result.status, 1, result.stdout + result.stderr);
+        assert.match(result.stderr, /executor failed; private error details withheld/);
+        assert.equal(fs.existsSync(`${base}.grading.json`), false, 'previous grading must not survive the failed new execution');
+        assert.equal(fs.existsSync(`${base}.trace.jsonl`), false, 'previous candidate trace must not survive the failed new execution');
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+}
